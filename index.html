@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Jim Game Center</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:#0c0d14;--panel:#171925;--toy:#f2b632;--alarm:#e0434f;--ok:#4cc38a;--txt:#ecebf2;--dim:#80829a}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);font-family:system-ui,sans-serif;user-select:none}
+#app{display:flex;flex-direction:column;height:100%;max-width:520px;margin:auto;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+#hud{display:flex;justify-content:space-between;padding:12px 16px;font-weight:700;font-size:18px}
+#view{flex:1;padding:6px 12px;overflow:auto}
+#bar{padding:10px 12px}
+button{font:inherit;color:var(--txt);background:var(--panel);border:2px solid #2b2e44;border-radius:10px;padding:12px;width:100%}
+button.on{background:var(--toy);color:#1b1608;border-color:var(--toy)}
+button.big{background:var(--toy);color:#1b1608;font-weight:700;border-color:var(--toy);padding:16px}
+.row{display:grid;gap:8px}.c3{grid-template-columns:repeat(3,1fr)}.c2{grid-template-columns:repeat(2,1fr)}
+.side{background:var(--panel);border-radius:12px;padding:8px;display:grid;gap:8px;align-content:start;text-align:center}
+.side b{font-size:13px;color:var(--dim)}
+.seen{min-height:40px;display:flex;align-items:center;justify-content:center;font-weight:700;color:var(--alarm);font-size:13px}
+.cam{background:repeating-linear-gradient(0deg,#1c1e2c 0 3px,#222536 3px 6px);border-radius:12px;min-height:170px;margin-top:8px;padding:14px;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;gap:8px}
+.cam h2{margin:0;font-size:20px}.rec{color:var(--alarm);font-size:12px;align-self:flex-start}
+.center{height:100%;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;gap:14px;padding:20px}
+.center h1{margin:0;font-size:30px;line-height:1.1;color:var(--toy)}
+.scare{position:fixed;inset:0;background:#000;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:16px;text-align:center;padding:24px;animation:shake .08s infinite}
+.scare .face{font-size:120px}.scare h2{color:var(--alarm);margin:0}
+@keyframes shake{50%{transform:translate(4px,-4px)}}
+@media (prefers-reduced-motion:reduce){.scare{animation:none}}
+.low{color:var(--alarm)}
+</style></head>
+<body><div id="app"><div id="hud"></div><div id="view"></div><div id="bar"></div></div>
+<script>
+const tg=window.Telegram?.WebApp;
+if(tg){tg.ready();tg.expand();try{tg.setHeaderColor('#0c0d14');tg.setBackgroundColor('#0c0d14')}catch(e){}}
+const buzz=t=>{try{tg?.HapticFeedback?.notificationOccurred(t)}catch(e){}};
+
+// ---------- ДАННЫЕ (потом можно вынести в JSON) ----------
+const ROOMS={stage:'Сцена',diner:'Закусочная',workshop:'Студия робототехники',dressing:'Гримёрка',hall:'Коридор'};
+const SIDES={left:'Левая дверь',window:'Окно',right:'Правая дверь'};
+// path: маршрут от сцены до точки атаки (последний элемент = сторона офиса)
+const ROBOTS={
+  michael:{name:'Майкл',icon:'🎸',path:['stage','diner','hall','left']},
+  david:{name:'Дэвид',icon:'🥁',path:['stage','diner','hall','left']},
+  emma:{name:'Эмма',icon:'🎤',path:['stage','diner','workshop','dressing','right']},
+  sophie:{name:'Софи',icon:'🎹',path:['stage','diner','workshop','right']},
+  jake:{name:'Джейк',icon:'🎷',path:['stage','diner','workshop','window']},
+  oliver:{name:'Оливер',icon:'🎻',path:['stage','diner','dressing','window']}
+};
+// уровень ИИ (0-20) по ночам
+const NIGHTS=[
+  {michael:3,emma:3},
+  {michael:4,emma:4,david:2},
+  {michael:5,emma:5,david:4,sophie:3},
+  {michael:6,emma:6,david:5,sophie:5,jake:4},
+  {michael:8,emma:8,david:7,sophie:7,jake:6,oliver:6}
+];
+const NIGHT_LEN=360;      // секунд реального времени на ночь (6 мин)
+const MOVE_EVERY=5;       // робот "думает" раз в N секунд
+const DRAIN={base:.15,door:.2,light:.2,cam:.1}; // % энергии в секунду
+
+// ---------- СОСТОЯНИЕ ----------
+let S=null, timer=null, night=0;
+const $=id=>document.getElementById(id);
+const rnd=n=>1+Math.floor(Math.random()*n);
+const hours=['12','1','2','3','4','5'];
+
+function newGame(){
+  S={t:0,power:100,doors:{left:false,window:false,right:false},lights:{left:false,window:false,right:false},
+     cam:false,room:'stage',pos:{},dark:0,over:false};
+  Object.keys(NIGHTS[night]).forEach(id=>S.pos[id]=0);
+  clearInterval(timer);timer=setInterval(tick,1000);
+  render();
+}
+
+function tick(){
+  if(S.over)return;
+  S.t++;
+  const closed=Object.values(S.doors).filter(Boolean).length;
+  const lit=Object.values(S.lights).filter(Boolean).length;
+  if(S.power>0){
+    S.power=Math.max(0,S.power-(DRAIN.base+closed*DRAIN.door+lit*DRAIN.light+(S.cam?DRAIN.cam:0)));
+    if(S.power===0){blackout()}
+  }else{
+    S.dark++; if(S.dark>=12)return lose('michael'); // свет погас — рано или поздно придут
+  }
+  if(S.t%MOVE_EVERY===0&&!moveRobots())return;
+  if(S.t>=NIGHT_LEN)return win();
+  render();
+}
+
+function blackout(){
+  Object.keys(S.doors).forEach(k=>{S.doors[k]=false;S.lights[k]=false});S.cam=false;buzz('error');
+}
+
+function moveRobots(){
+  for(const [id,ai] of Object.entries(NIGHTS[night])){
+    if(rnd(20)>ai)continue;
+    const r=ROBOTS[id],last=r.path.length-1;
+    if(S.pos[id]<last){S.pos[id]++;if(S.pos[id]===last)buzz('warning')}
+    else if(S.doors[r.path[last]]){S.pos[id]=1} // дверь выдержала — отступил в закусочную
+    else{lose(id);return false}
+  }
+  return true;
+}
+
+function lose(id){
+  S.over=true;clearInterval(timer);buzz('error');
+  const r=ROBOTS[id];
+  $('view').innerHTML=`<div class="scare"><div class="face">${r.icon}</div><h2>${r.name} добрался до тебя</h2>
+  <p>Ночь ${night+1}, ${hours[Math.floor(S.t/60)]||'5'} AM</p><button id="retry" class="big">Попробовать снова</button></div>`;
+  $('hud').innerHTML='';$('bar').innerHTML='';
+  $('retry').onclick=newGame;
+}
+
+function win(){
+  S.over=true;clearInterval(timer);buzz('success');
+  const last=night>=NIGHTS.length-1;
+  try{tg?.CloudStorage?.setItem('night',String(last?0:night+1))}catch(e){}
+  $('hud').innerHTML='';$('bar').innerHTML='';
+  $('view').innerHTML=`<div class="center"><h1>6:00 AM</h1><p>Ночь ${night+1} пережита.</p>
+  <button id="next" class="big">${last?'Ты прошёл все ночи (в начало)':'Ночь '+(night+2)}</button></div>`;
+  $('next').onclick=()=>{night=last?0:night+1;newGame()};
+}
+
+// ---------- ИНТЕРФЕЙС ----------
+function who(side){ // кто стоит у точки атаки
+  return Object.keys(S.pos).filter(id=>{const p=ROBOTS[id].path;return S.pos[id]===p.length-1&&p[p.length-1]===side});
+}
+function render(){
+  const h=hours[Math.min(5,Math.floor(S.t/60))];
+  $('hud').innerHTML=`<span>${h} AM</span><span>Ночь ${night+1}</span><span class="${S.power<20?'low':''}">⚡ ${Math.ceil(S.power)}%</span>`;
+  $('view').innerHTML=S.cam?camView():officeView();
+  $('bar').innerHTML=`<button data-a="cam" class="${S.cam?'on':''}">${S.cam?'Вернуться в офис':'Камеры'}</button>`;
+}
+function officeView(){
+  return `<div class="row c3">`+Object.keys(SIDES).map(s=>{
+    const w=S.lights[s]?who(s):[];
+    return `<div class="side"><b>${SIDES[s]}</b>
+      <div class="seen">${S.lights[s]?(w.length?w.map(i=>ROBOTS[i].icon+' '+ROBOTS[i].name).join('<br>'):'пусто'):'темно'}</div>
+      <button data-a="door" data-s="${s}" class="${S.doors[s]?'on':''}">${S.doors[s]?'Закрыто':'Открыто'}</button>
+      <button data-a="light" data-s="${s}" class="${S.lights[s]?'on':''}">Свет</button></div>`}).join('')+`</div>`;
+}
+function camView(){
+  const here=Object.keys(S.pos).filter(id=>ROBOTS[id].path[S.pos[id]]===S.room);
+  return `<div class="row c2">`+Object.keys(ROOMS).map(r=>`<button data-a="room" data-r="${r}" class="${S.room===r?'on':''}">${ROOMS[r]}</button>`).join('')+`</div>
+  <div class="cam"><span class="rec">● REC</span><h2>${ROOMS[S.room]}</h2>
+  <div>${here.length?here.map(i=>ROBOTS[i].icon+' '+ROBOTS[i].name).join('<br>'):'никого'}</div></div>`;
+}
+document.addEventListener('click',e=>{
+  const b=e.target.closest('button[data-a]');if(!b||!S||S.over)return;
+  const a=b.dataset.a,s=b.dataset.s;
+  if(S.power<=0&&a!=='room')return;
+  if(a==='cam')S.cam=!S.cam;
+  if(a==='room')S.room=b.dataset.r;
+  if(a==='door')S.doors[s]=!S.doors[s];
+  if(a==='light')S.lights[s]=!S.lights[s];
+  try{tg?.HapticFeedback?.impactOccurred('light')}catch(e){}
+  render();
+});
+
+// ---------- СТАРТ ----------
+function menu(){
+  $('hud').innerHTML='';$('bar').innerHTML='';
+  $('view').innerHTML=`<div class="center"><h1>Jim Game Center</h1><p>Человек, который открыл окно</p>
+  <button id="go" class="big">Ночь ${night+1}</button></div>`;
+  $('go').onclick=newGame;
+}
+try{tg.CloudStorage.getItem('night',(err,v)=>{if(!err&&v)night=Math.min(+v||0,NIGHTS.length-1);menu()})}catch(e){menu()}
+setTimeout(()=>{if(!S&&!$('go'))menu()},800);
+</script></body></html>
